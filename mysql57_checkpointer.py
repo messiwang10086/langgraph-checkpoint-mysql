@@ -38,15 +38,20 @@ from typing_extensions import Self
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import (
+    WRITES_IDX_MAP,
+    ChannelVersions,
+    Checkpoint,
+    CheckpointMetadata,
     CheckpointTuple,
     get_checkpoint_id,
+    get_checkpoint_metadata,
 )
 from langgraph.checkpoint.mysql.pymysql import PyMySQLSaver
 
 
 # ============================================
-# MySQL 5.7 兼容的 SELECT SQL
-# 不使用 JSON_TABLE, JSON_ARRAYAGG, WITH CTE
+# MySQL 5.7 / PolarDB-X 兼容的 SQL 语句
+# 不使用 JSON_TABLE, JSON_ARRAYAGG, WITH CTE, VALUES AS
 # ============================================
 
 MYSQL57_SELECT_SQL = """
@@ -59,6 +64,37 @@ SELECT
     c.metadata
 FROM checkpoints c
 {WHERE}
+"""
+
+# PolarDB-X 兼容的 UPSERT 语句（使用 VALUES() 函数）
+MYSQL57_UPSERT_CHECKPOINT_BLOBS_SQL = """
+    INSERT INTO checkpoint_blobs (thread_id, checkpoint_ns, checkpoint_ns_hash, channel, version, type, `blob`)
+    VALUES (%s, %s, UNHEX(MD5(%s)), %s, %s, %s, %s)
+    ON DUPLICATE KEY UPDATE
+        type = VALUES(type),
+        `blob` = VALUES(`blob`)
+"""
+
+MYSQL57_UPSERT_CHECKPOINTS_SQL = """
+    INSERT INTO checkpoints (thread_id, checkpoint_ns, checkpoint_ns_hash, checkpoint_id, parent_checkpoint_id, checkpoint, metadata)
+    VALUES (%s, %s, UNHEX(MD5(%s)), %s, %s, %s, %s)
+    ON DUPLICATE KEY UPDATE
+        checkpoint = VALUES(checkpoint),
+        metadata = VALUES(metadata)
+"""
+
+MYSQL57_UPSERT_CHECKPOINT_WRITES_SQL = """
+    INSERT INTO checkpoint_writes (thread_id, checkpoint_ns, checkpoint_ns_hash, checkpoint_id, task_id, task_path, idx, channel, type, `blob`)
+    VALUES (%s, %s, UNHEX(MD5(%s)), %s, %s, %s, %s, %s, %s, %s)
+    ON DUPLICATE KEY UPDATE
+        channel = VALUES(channel),
+        type = VALUES(type),
+        `blob` = VALUES(`blob`)
+"""
+
+MYSQL57_INSERT_CHECKPOINT_WRITES_SQL = """
+    INSERT IGNORE INTO checkpoint_writes (thread_id, checkpoint_ns, checkpoint_ns_hash, checkpoint_id, task_id, task_path, idx, channel, type, `blob`)
+    VALUES (%s, %s, UNHEX(MD5(%s)), %s, %s, %s, %s, %s, %s, %s)
 """
 
 
@@ -311,6 +347,124 @@ class MySQL57Saver(PyMySQLSaver):
             )
             for row in rows
         ]
+
+    def put(
+        self,
+        config: RunnableConfig,
+        checkpoint: Checkpoint,
+        metadata: CheckpointMetadata,
+        new_versions: ChannelVersions,
+    ) -> RunnableConfig:
+        """
+        重写：保存 checkpoint
+
+        使用 PolarDB-X 兼容的 UPSERT 语句（VALUES() 函数而不是 AS new 语法）
+
+        Args:
+            config: 配置
+            checkpoint: checkpoint 数据
+            metadata: 元数据
+            new_versions: 新的 channel 版本
+
+        Returns:
+            RunnableConfig: 更新后的配置
+
+        Example:
+            >>> config = {"configurable": {"thread_id": "1", "checkpoint_ns": ""}}
+            >>> checkpoint = {...}
+            >>> new_config = checkpointer.put(config, checkpoint, {}, {})
+        """
+        configurable = config["configurable"].copy()
+        thread_id = configurable.pop("thread_id")
+        checkpoint_ns = configurable.pop("checkpoint_ns")
+        checkpoint_id = configurable.pop("checkpoint_id", None)
+
+        copy = checkpoint.copy()
+        copy["channel_values"] = copy["channel_values"].copy()
+
+        next_config = {
+            "configurable": {
+                "thread_id": thread_id,
+                "checkpoint_ns": checkpoint_ns,
+                "checkpoint_id": checkpoint["id"],
+            }
+        }
+
+        # 内联简单值，大对象存到 blobs 表
+        blob_values = {}
+        for k, v in checkpoint["channel_values"].items():
+            if v is None or isinstance(v, (str, int, float, bool)):
+                pass  # 保留在 checkpoint 中
+            else:
+                blob_values[k] = copy["channel_values"].pop(k)
+
+        with self._cursor(pipeline=True) as cur:
+            # 保存 blobs
+            if blob_versions := {
+                k: v for k, v in new_versions.items() if k in blob_values
+            }:
+                cur.executemany(
+                    MYSQL57_UPSERT_CHECKPOINT_BLOBS_SQL,
+                    self._dump_blobs(
+                        thread_id,
+                        checkpoint_ns,
+                        blob_values,
+                        blob_versions,
+                    ),
+                )
+
+            # 保存 checkpoint
+            cur.execute(
+                MYSQL57_UPSERT_CHECKPOINTS_SQL,
+                (
+                    thread_id,
+                    checkpoint_ns,
+                    checkpoint_ns,
+                    checkpoint["id"],
+                    checkpoint_id,
+                    json.dumps(copy),
+                    self._dump_metadata(get_checkpoint_metadata(config, metadata)),
+                ),
+            )
+
+        return next_config
+
+    def put_writes(
+        self,
+        config: RunnableConfig,
+        writes: list[tuple[str, Any]],
+        task_id: str,
+        task_path: str = "",
+    ) -> None:
+        """
+        重写：保存中间写入
+
+        使用 PolarDB-X 兼容的 UPSERT 语句
+
+        Args:
+            config: 配置
+            writes: 写入数据列表
+            task_id: 任务 ID
+            task_path: 任务路径
+        """
+        query = (
+            MYSQL57_UPSERT_CHECKPOINT_WRITES_SQL
+            if all(w[0] in WRITES_IDX_MAP for w in writes)
+            else MYSQL57_INSERT_CHECKPOINT_WRITES_SQL
+        )
+
+        with self._cursor(pipeline=True) as cur:
+            cur.executemany(
+                query,
+                self._dump_writes(
+                    config["configurable"]["thread_id"],
+                    config["configurable"]["checkpoint_ns"],
+                    config["configurable"]["checkpoint_id"],
+                    task_id,
+                    task_path,
+                    writes,
+                ),
+            )
 
     def list(
         self,
