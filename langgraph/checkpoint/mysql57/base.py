@@ -11,6 +11,18 @@ JSON_ARRAYAGG()             NO          YES         YES   ← multi-step query
 WITH CTE                    NO          YES         YES   ← rewrite
 VALUES(...) AS new          NO          YES(8.0.19) NO    ← use VALUES(col)
 STORED generated col in PK  limited     YES         NO    ← explicit BINARY(16)
+UNHEX(MD5()) in DML/WHERE   partial     YES         YES   ← pre-compute in Python
+
+PolarDB-X / TDDL note
+---------------------
+PolarDB-X must evaluate the sharding key before routing a statement to a shard.
+When the sharding key value is expressed as  UNHEX(MD5(%s))  the distributed
+planner cannot resolve it at parse time and raises:
+  ERR_PARSER: failed to split sql (TDDL-4500)
+
+Fix: compute  hashlib.md5(checkpoint_ns).digest()  in Python and pass the
+resulting bytes directly as a  %s  parameter.  The  _md5_hash()  helper
+below is the Python equivalent of MySQL's  UNHEX(MD5(text)).
 
 This module implements all database-agnostic logic (SQL constants, schema
 migrations, serialization helpers). Driver-specific classes live in
@@ -19,6 +31,7 @@ sync.py (pymysql) and aio.py (aiomysql).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 from collections.abc import Sequence
@@ -34,6 +47,27 @@ from langgraph.checkpoint.base import (
 
 MetadataInput = Optional[dict[str, Any]]
 
+
+def _md5_hash(text: str) -> bytes:
+    """
+    Python equivalent of MySQL's  UNHEX(MD5(text)).
+
+    Returns 16 raw bytes — the same value that MySQL would store in a
+    BINARY(16) column via  UNHEX(MD5(text)).
+
+    Why pre-compute instead of letting MySQL do it
+    -----------------------------------------------
+    PolarDB-X (TDDL) must resolve the sharding key value *before* routing
+    the SQL to a shard.  When the value is written as an expression such as
+    UNHEX(MD5(%s)), the distributed parser cannot evaluate it at parse time
+    and raises  ERR_PARSER: failed to split sql  (error code TDDL-4500).
+
+    Pre-computing in Python and passing raw bytes as a  %s  parameter avoids
+    this entirely.  Standard MySQL 5.7 and MariaDB are also happy with bytes.
+    """
+    return hashlib.md5(text.encode("utf-8")).digest()
+
+
 # ---------------------------------------------------------------------------
 # Schema migrations (MySQL 5.7 compatible)
 #
@@ -43,7 +77,7 @@ MetadataInput = Optional[dict[str, Any]]
 #      equivalent for our use case; JSON functions still work on it.
 #   2. Explicit BINARY(16) column for checkpoint_ns_hash — MySQL 5.7
 #      has restrictions on using STORED generated columns as primary key
-#      members; we compute UNHEX(MD5(...)) explicitly in every DML statement.
+#      members; we pass pre-computed bytes from _md5_hash() in every DML.
 #   3. No generated / virtual columns at all.
 # ---------------------------------------------------------------------------
 
@@ -114,27 +148,40 @@ FROM checkpoints c
 
 # Batch-load blobs for a set of channels.  Version matching is done in Python
 # so that we need only one query regardless of how many channels exist.
+# NOTE: checkpoint_ns_hash param is pre-computed bytes via _md5_hash()
 SELECT_BLOBS_SQL = """
 SELECT channel, version, type, `blob`
 FROM checkpoint_blobs
 WHERE thread_id = %s
-  AND checkpoint_ns_hash = UNHEX(MD5(%s))
+  AND checkpoint_ns_hash = %s
   AND channel IN ({PLACEHOLDERS})"""
 
 # Load pending writes for one checkpoint, ordered for deterministic assembly.
+# NOTE: checkpoint_ns_hash param is pre-computed bytes via _md5_hash()
 SELECT_WRITES_SQL = """
 SELECT task_id, channel, type, `blob`, idx
 FROM checkpoint_writes
 WHERE thread_id = %s
-  AND checkpoint_ns_hash = UNHEX(MD5(%s))
+  AND checkpoint_ns_hash = %s
   AND checkpoint_id = %s
 ORDER BY task_id, idx"""
 
 # ---------------------------------------------------------------------------
-# UPSERT / INSERT SQL  (MySQL 5.7 compatible)
+# UPSERT / INSERT SQL  (MySQL 5.7 + PolarDB-X compatible)
 #
-# Uses  ON DUPLICATE KEY UPDATE col = VALUES(col)  instead of the MySQL 8.0
-# syntax  INSERT ... AS new ... ON DUPLICATE KEY UPDATE col = new.col
+# Two key changes vs official langgraph-checkpoint-mysql:
+#
+# 1. ON DUPLICATE KEY UPDATE col = VALUES(col)
+#    instead of  INSERT ... AS new ... ON DUPLICATE KEY UPDATE col = new.col
+#    (the AS alias syntax is MySQL 8.0.19+ only)
+#
+# 2. checkpoint_ns_hash = %s  (raw bytes, pre-computed by _md5_hash())
+#    instead of  UNHEX(MD5(%s))
+#
+#    PolarDB-X (TDDL) must evaluate the sharding key value before routing the
+#    statement.  When the value is expressed as UNHEX(MD5(%s)), the distributed
+#    parser cannot resolve it at parse time and raises TDDL-4500
+#    "failed to split sql".  Passing pre-computed bytes avoids this entirely.
 # ---------------------------------------------------------------------------
 
 # Blobs are content-addressed: identical channel+version ⟹ identical bytes.
@@ -143,14 +190,14 @@ UPSERT_CHECKPOINT_BLOBS_SQL = """
     INSERT IGNORE INTO checkpoint_blobs
         (thread_id, checkpoint_ns, checkpoint_ns_hash,
          channel, version, type, `blob`)
-    VALUES (%s, %s, UNHEX(MD5(%s)), %s, %s, %s, %s)"""
+    VALUES (%s, %s, %s, %s, %s, %s, %s)"""
 
 # Checkpoints may be re-saved (e.g. on graph retry).
 UPSERT_CHECKPOINTS_SQL = """
     INSERT INTO checkpoints
         (thread_id, checkpoint_ns, checkpoint_ns_hash,
          checkpoint_id, parent_checkpoint_id, checkpoint, metadata)
-    VALUES (%s, %s, UNHEX(MD5(%s)), %s, %s, %s, %s)
+    VALUES (%s, %s, %s, %s, %s, %s, %s)
     ON DUPLICATE KEY UPDATE
         checkpoint = VALUES(checkpoint),
         metadata   = VALUES(metadata)"""
@@ -160,7 +207,7 @@ UPSERT_CHECKPOINT_WRITES_SQL = """
     INSERT INTO checkpoint_writes
         (thread_id, checkpoint_ns, checkpoint_ns_hash,
          checkpoint_id, task_id, task_path, idx, channel, type, `blob`)
-    VALUES (%s, %s, UNHEX(MD5(%s)), %s, %s, %s, %s, %s, %s, %s)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     ON DUPLICATE KEY UPDATE
         channel = VALUES(channel),
         type    = VALUES(type),
@@ -171,7 +218,7 @@ INSERT_CHECKPOINT_WRITES_SQL = """
     INSERT IGNORE INTO checkpoint_writes
         (thread_id, checkpoint_ns, checkpoint_ns_hash,
          checkpoint_id, task_id, task_path, idx, channel, type, `blob`)
-    VALUES (%s, %s, UNHEX(MD5(%s)), %s, %s, %s, %s, %s, %s, %s)"""
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
 
 
 # ---------------------------------------------------------------------------
@@ -209,16 +256,19 @@ class BaseMySQLSaver57(BaseCheckpointSaver[str]):
         """
         Serialize channel values into rows for checkpoint_blobs.
 
-        The third element in each tuple is checkpoint_ns again: it feeds
-        the UNHEX(MD5(%s)) expression for the checkpoint_ns_hash column.
+        The third element in each tuple is the pre-computed MD5 hash bytes
+        for the checkpoint_ns_hash column.  We compute it once per call
+        (not once per row) so that _md5_hash() is only called once even when
+        there are many channels.
         """
         if not versions:
             return []
+        ns_hash = _md5_hash(checkpoint_ns)   # pre-compute once, reuse per row
         return [
             (
                 thread_id,
                 checkpoint_ns,
-                checkpoint_ns,          # → UNHEX(MD5(%s))
+                ns_hash,                # raw bytes → BINARY(16) column
                 k,
                 cast(str, ver),
                 *(
@@ -240,11 +290,12 @@ class BaseMySQLSaver57(BaseCheckpointSaver[str]):
         writes: Sequence[tuple[str, Any]],
     ) -> list[tuple]:
         """Serialize writes into rows for checkpoint_writes."""
+        ns_hash = _md5_hash(checkpoint_ns)   # pre-compute once, reuse per row
         return [
             (
                 thread_id,
                 checkpoint_ns,
-                checkpoint_ns,          # → UNHEX(MD5(%s))
+                ns_hash,                # raw bytes → BINARY(16) column
                 checkpoint_id,
                 task_id,
                 task_path,
@@ -349,10 +400,10 @@ class BaseMySQLSaver57(BaseCheckpointSaver[str]):
 
             checkpoint_ns = config["configurable"].get("checkpoint_ns")
             if checkpoint_ns is not None:
-                wheres.append(
-                    "c.checkpoint_ns_hash = UNHEX(MD5(%(checkpoint_ns)s))"
-                )
-                params["checkpoint_ns"] = checkpoint_ns
+                # Pass pre-computed bytes — avoids UNHEX(MD5(...)) expression
+                # that PolarDB-X (TDDL) cannot evaluate for shard routing.
+                wheres.append("c.checkpoint_ns_hash = %(checkpoint_ns_hash)s")
+                params["checkpoint_ns_hash"] = _md5_hash(checkpoint_ns)
 
             if checkpoint_id := get_checkpoint_id(config):
                 wheres.append("c.checkpoint_id = %(checkpoint_id)s")

@@ -74,6 +74,7 @@ from .base import (
     UPSERT_CHECKPOINT_BLOBS_SQL,
     UPSERT_CHECKPOINTS_SQL,
     UPSERT_CHECKPOINT_WRITES_SQL,
+    _md5_hash,
 )
 
 logger = logging.getLogger(__name__)
@@ -309,26 +310,27 @@ class AIOMySQL57Saver(BaseMySQLSaver57):
         thread_id     = config["configurable"]["thread_id"]
         checkpoint_id = get_checkpoint_id(config)
         checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
+        ns_hash       = _md5_hash(checkpoint_ns)  # pre-compute
 
         if checkpoint_id:
             where = (
                 "WHERE c.thread_id = %(thread_id)s"
-                " AND c.checkpoint_ns_hash = UNHEX(MD5(%(checkpoint_ns)s))"
+                " AND c.checkpoint_ns_hash = %(checkpoint_ns_hash)s"
                 " AND c.checkpoint_id = %(checkpoint_id)s"
             )
             args: dict[str, Any] = {
-                "thread_id":     thread_id,
-                "checkpoint_ns": checkpoint_ns,
-                "checkpoint_id": checkpoint_id,
+                "thread_id":          thread_id,
+                "checkpoint_ns_hash": ns_hash,
+                "checkpoint_id":      checkpoint_id,
             }
         else:
             where = (
                 "WHERE c.thread_id = %(thread_id)s"
-                " AND c.checkpoint_ns_hash = UNHEX(MD5(%(checkpoint_ns)s))"
+                " AND c.checkpoint_ns_hash = %(checkpoint_ns_hash)s"
             )
             args = {
-                "thread_id":     thread_id,
-                "checkpoint_ns": checkpoint_ns,
+                "thread_id":          thread_id,
+                "checkpoint_ns_hash": ns_hash,
             }
 
         query = self._select_sql(where)
@@ -352,13 +354,13 @@ class AIOMySQL57Saver(BaseMySQLSaver57):
                 channels = list(channel_versions.keys())
                 await cur.execute(
                     self._select_blobs_sql(channels),
-                    (thread_id, checkpoint_ns, *channels),
+                    (thread_id, ns_hash, *channels),
                 )
                 blob_rows = await cur.fetchall()
 
             await cur.execute(
                 SELECT_WRITES_SQL,
-                (thread_id, checkpoint_ns, row["checkpoint_id"]),
+                (thread_id, ns_hash, row["checkpoint_id"]),
             )
             write_rows = await cur.fetchall()
 
@@ -408,6 +410,7 @@ class AIOMySQL57Saver(BaseMySQLSaver57):
             thread_id     = row["thread_id"]
             checkpoint_ns = row["checkpoint_ns"]
             checkpoint_id = row["checkpoint_id"]
+            ns_hash       = _md5_hash(checkpoint_ns)  # pre-compute
 
             async with self._cursor() as cur:
                 blob_rows: list[dict] = []
@@ -415,13 +418,13 @@ class AIOMySQL57Saver(BaseMySQLSaver57):
                     channels = list(channel_versions.keys())
                     await cur.execute(
                         self._select_blobs_sql(channels),
-                        (thread_id, checkpoint_ns, *channels),
+                        (thread_id, ns_hash, *channels),
                     )
                     blob_rows = await cur.fetchall()
 
                 await cur.execute(
                     SELECT_WRITES_SQL,
-                    (thread_id, checkpoint_ns, checkpoint_id),
+                    (thread_id, ns_hash, checkpoint_id),
                 )
                 write_rows = await cur.fetchall()
 
@@ -486,6 +489,7 @@ class AIOMySQL57Saver(BaseMySQLSaver57):
         thread_id     = configurable.pop("thread_id")
         checkpoint_ns = configurable.pop("checkpoint_ns")
         checkpoint_id = configurable.pop("checkpoint_id", None)
+        ns_hash       = _md5_hash(checkpoint_ns)  # pre-compute once
 
         copy = checkpoint.copy()
         copy["channel_values"] = copy["channel_values"].copy()
@@ -515,7 +519,7 @@ class AIOMySQL57Saver(BaseMySQLSaver57):
                 (
                     thread_id,
                     checkpoint_ns,
-                    checkpoint_ns,
+                    ns_hash,            # raw bytes → BINARY(16)
                     checkpoint["id"],
                     checkpoint_id,
                     json.dumps(copy),
@@ -702,26 +706,27 @@ class AIOMySQL57PoolSaver(BaseMySQLSaver57):
         thread_id     = config["configurable"]["thread_id"]
         checkpoint_id = get_checkpoint_id(config)
         checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
+        ns_hash       = _md5_hash(checkpoint_ns)  # pre-compute
 
         if checkpoint_id:
             where = (
                 "WHERE c.thread_id = %(thread_id)s"
-                " AND c.checkpoint_ns_hash = UNHEX(MD5(%(checkpoint_ns)s))"
+                " AND c.checkpoint_ns_hash = %(checkpoint_ns_hash)s"
                 " AND c.checkpoint_id = %(checkpoint_id)s"
             )
             args: dict[str, Any] = {
-                "thread_id":     thread_id,
-                "checkpoint_ns": checkpoint_ns,
-                "checkpoint_id": checkpoint_id,
+                "thread_id":          thread_id,
+                "checkpoint_ns_hash": ns_hash,
+                "checkpoint_id":      checkpoint_id,
             }
         else:
             where = (
                 "WHERE c.thread_id = %(thread_id)s"
-                " AND c.checkpoint_ns_hash = UNHEX(MD5(%(checkpoint_ns)s))"
+                " AND c.checkpoint_ns_hash = %(checkpoint_ns_hash)s"
             )
             args = {
-                "thread_id":     thread_id,
-                "checkpoint_ns": checkpoint_ns,
+                "thread_id":          thread_id,
+                "checkpoint_ns_hash": ns_hash,
             }
 
         query = self._select_sql(where)
@@ -745,13 +750,13 @@ class AIOMySQL57PoolSaver(BaseMySQLSaver57):
                 channels = list(channel_versions.keys())
                 await cur.execute(
                     self._select_blobs_sql(channels),
-                    (thread_id, checkpoint_ns, *channels),
+                    (thread_id, ns_hash, *channels),
                 )
                 blob_rows = await cur.fetchall()
 
             await cur.execute(
                 SELECT_WRITES_SQL,
-                (thread_id, checkpoint_ns, row["checkpoint_id"]),
+                (thread_id, ns_hash, row["checkpoint_id"]),
             )
             write_rows = await cur.fetchall()
 
@@ -784,6 +789,7 @@ class AIOMySQL57PoolSaver(BaseMySQLSaver57):
             thread_id     = row["thread_id"]
             checkpoint_ns = row["checkpoint_ns"]
             checkpoint_id = row["checkpoint_id"]
+            ns_hash       = _md5_hash(checkpoint_ns)  # pre-compute
 
             async with self._acquire() as cur:
                 blob_rows: list[dict] = []
@@ -791,13 +797,13 @@ class AIOMySQL57PoolSaver(BaseMySQLSaver57):
                     channels = list(channel_versions.keys())
                     await cur.execute(
                         self._select_blobs_sql(channels),
-                        (thread_id, checkpoint_ns, *channels),
+                        (thread_id, ns_hash, *channels),
                     )
                     blob_rows = await cur.fetchall()
 
                 await cur.execute(
                     SELECT_WRITES_SQL,
-                    (thread_id, checkpoint_ns, checkpoint_id),
+                    (thread_id, ns_hash, checkpoint_id),
                 )
                 write_rows = await cur.fetchall()
 
@@ -821,6 +827,7 @@ class AIOMySQL57PoolSaver(BaseMySQLSaver57):
         thread_id     = configurable.pop("thread_id")
         checkpoint_ns = configurable.pop("checkpoint_ns")
         checkpoint_id = configurable.pop("checkpoint_id", None)
+        ns_hash       = _md5_hash(checkpoint_ns)  # pre-compute once
 
         copy = checkpoint.copy()
         copy["channel_values"] = copy["channel_values"].copy()
@@ -850,7 +857,7 @@ class AIOMySQL57PoolSaver(BaseMySQLSaver57):
                 (
                     thread_id,
                     checkpoint_ns,
-                    checkpoint_ns,
+                    ns_hash,            # raw bytes → BINARY(16)
                     checkpoint["id"],
                     checkpoint_id,
                     json.dumps(copy),

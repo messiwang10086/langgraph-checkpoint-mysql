@@ -58,6 +58,7 @@ from .base import (
     UPSERT_CHECKPOINT_BLOBS_SQL,
     UPSERT_CHECKPOINTS_SQL,
     UPSERT_CHECKPOINT_WRITES_SQL,
+    _md5_hash,
 )
 
 
@@ -231,25 +232,27 @@ class MySQL57Saver(BaseMySQLSaver57):
         checkpoint_id = get_checkpoint_id(config)
         checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
 
+        ns_hash = _md5_hash(checkpoint_ns)  # pre-compute to avoid UNHEX(MD5()) in SQL
+
         if checkpoint_id:
             where = (
                 "WHERE c.thread_id = %(thread_id)s"
-                " AND c.checkpoint_ns_hash = UNHEX(MD5(%(checkpoint_ns)s))"
+                " AND c.checkpoint_ns_hash = %(checkpoint_ns_hash)s"
                 " AND c.checkpoint_id = %(checkpoint_id)s"
             )
             args: dict[str, Any] = {
-                "thread_id":     thread_id,
-                "checkpoint_ns": checkpoint_ns,
-                "checkpoint_id": checkpoint_id,
+                "thread_id":          thread_id,
+                "checkpoint_ns_hash": ns_hash,
+                "checkpoint_id":      checkpoint_id,
             }
         else:
             where = (
                 "WHERE c.thread_id = %(thread_id)s"
-                " AND c.checkpoint_ns_hash = UNHEX(MD5(%(checkpoint_ns)s))"
+                " AND c.checkpoint_ns_hash = %(checkpoint_ns_hash)s"
             )
             args = {
-                "thread_id":     thread_id,
-                "checkpoint_ns": checkpoint_ns,
+                "thread_id":          thread_id,
+                "checkpoint_ns_hash": ns_hash,
             }
 
         query = self._select_sql(where)
@@ -271,14 +274,14 @@ class MySQL57Saver(BaseMySQLSaver57):
                 channels = list(channel_versions.keys())
                 cur.execute(
                     self._select_blobs_sql(channels),
-                    (thread_id, checkpoint_ns, *channels),
+                    (thread_id, ns_hash, *channels),
                 )
                 blob_rows = cur.fetchall()
 
             # Load pending writes
             cur.execute(
                 SELECT_WRITES_SQL,
-                (thread_id, checkpoint_ns, row["checkpoint_id"]),
+                (thread_id, ns_hash, row["checkpoint_id"]),
             )
             write_rows = cur.fetchall()
 
@@ -321,6 +324,7 @@ class MySQL57Saver(BaseMySQLSaver57):
             thread_id     = row["thread_id"]
             checkpoint_ns = row["checkpoint_ns"]
             checkpoint_id = row["checkpoint_id"]
+            ns_hash       = _md5_hash(checkpoint_ns)  # pre-compute
 
             with self._cursor() as cur:
                 blob_rows: list[dict] = []
@@ -328,13 +332,13 @@ class MySQL57Saver(BaseMySQLSaver57):
                     channels = list(channel_versions.keys())
                     cur.execute(
                         self._select_blobs_sql(channels),
-                        (thread_id, checkpoint_ns, *channels),
+                        (thread_id, ns_hash, *channels),
                     )
                     blob_rows = cur.fetchall()
 
                 cur.execute(
                     SELECT_WRITES_SQL,
-                    (thread_id, checkpoint_ns, checkpoint_id),
+                    (thread_id, ns_hash, checkpoint_id),
                 )
                 write_rows = cur.fetchall()
 
@@ -376,6 +380,8 @@ class MySQL57Saver(BaseMySQLSaver57):
             if not (v is None or isinstance(v, (str, int, float, bool))):
                 blob_values[k] = copy["channel_values"].pop(k)
 
+        ns_hash = _md5_hash(checkpoint_ns)  # pre-compute once for all writes
+
         with self._cursor(pipeline=True) as cur:
             blob_versions = {
                 k: v for k, v in new_versions.items() if k in blob_values
@@ -392,7 +398,7 @@ class MySQL57Saver(BaseMySQLSaver57):
                 (
                     thread_id,
                     checkpoint_ns,
-                    checkpoint_ns,          # → UNHEX(MD5(%s))
+                    ns_hash,                # raw bytes → BINARY(16)
                     checkpoint["id"],
                     checkpoint_id,
                     json.dumps(copy),
